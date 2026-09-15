@@ -1,0 +1,4 @@
+key,q_revenue_cr,ttm_revenue_cr,ebitda_margin,market_cap_cr,latest_quarter
+# Example override. `key` may be an NSE symbol, a BSE code or an ISIN.
+# Anything listed here beats the NSE/yfinance lookups.
+# TITAN,14500,55000,0.11,320000,2026-06-30

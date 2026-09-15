@@ -1,0 +1,8 @@
+requests>=2.31
+pdfplumber>=0.11
+PyMuPDF>=1.24            # faster PDF fallback; optional
+python-dotenv>=1.0
+fastapi>=0.110
+uvicorn[standard]>=0.29
+yfinance>=0.2.40         # fundamentals fallback
+anthropic>=0.40          # LLM fallback (or use openai instead)
