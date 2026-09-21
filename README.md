@@ -171,7 +171,7 @@ Task Scheduler -> Create Task
 `conhost --headless` stops a console window flashing up every hour. "Run whether
 user is logged on or not" also works, but needs admin rights or a stored password.
 
-On Linux/macOS instead: `0 8-21 * * 1-5 cd /path && python -m order_scanner.cli scan`
+On Linux/macOS instead: `0 8-21 * * * cd /path && python -m order_scanner.cli scan`
 
 **The PC has to be on and awake for a scan to run, but hours it isn't are not
 lost.** A scheduled scan covers `lookback_minutes + overlap_minutes` (60 + 10) or
@@ -180,8 +180,10 @@ back, up to `max_catchup_hours` (96, enough for a weekend). Switch the PC on aft
 a day away and the next run picks up that day's filings; their alerts arrive
 late, and filings over 48 hours old carry the stale discount. For gaps longer
 than four days, run `backfill --days N`. Deduplication is by
-`sha1(exchange|native_id)`, so overlap is free. Runs outside 08:00–22:00 IST and
-on weekends are no-ops unless you pass `--force`; `--lookback N` scans exactly N
+`sha1(exchange|native_id)`, so overlap is free. Runs outside 08:00–22:00 IST are no-ops
+unless you pass `--force`. Weekends are scanned: Saturday is a working filing
+day on both exchanges (in a 90-day sample, 203 orders were filed on a Saturday
+and 43 on a Sunday). Set `scan_weekends = False` to skip them; `--lookback N` scans exactly N
 minutes and skips the catch-up.
 
 **Dashboard at sign-in.** A second task, "Order Scanner Dashboard", runs
