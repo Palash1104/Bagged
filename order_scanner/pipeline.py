@@ -386,7 +386,7 @@ def run_scan(lookback_minutes: int | None = None, force: bool = False,
                                  company["name"], sr.tier, sr.score)
                         stats["n_alerts"] += 1
                     elif not already_alerted(conn, rec["ann_id"], "telegram"):
-                        msg = format_message(order_dict | order_row, sr, funds)
+                        msg = format_message(order_dict | order_row, sr, funds, company)
                         ok, err = send_telegram(msg)
                         record_alert(conn, rec["ann_id"], "telegram", sr.tier, ok, err)
                         if ok:

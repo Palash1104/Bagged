@@ -438,12 +438,14 @@ def _sample_alert_text() -> str:
             "quarterly_ratio": {"points": 18.0, "max": 20.0},
             "firmness": {"points": 15.0, "max": 15.0},
         },
-        penalties={}, data_quality="good",
+        penalties={}, data_quality="good", guidance={},
+        reasons=["override: order is 72% of last quarter's revenue"],
     )
     funds = {"q_revenue_inr": 5.9e9, "ttm_revenue_inr": 2.0e10,
              "source": "sample"}
+    company = {"nse_symbol": "SAMPLE", "industry": "Heavy Electrical Equipment"}
     return ("\U0001F9EA <i>test alert — order-scanner wiring check</i>\n\n"
-            + format_message(order, score_res, funds))
+            + format_message(order, score_res, funds, company))
 
 
 def cmd_test_alert(args) -> int:
