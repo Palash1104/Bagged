@@ -1,4 +1,5 @@
 requests>=2.31
+curl_cffi>=0.7         # Chrome-identical TLS; BSE refuses python-requests since 30 Sep 2026
 pdfplumber>=0.11
 PyMuPDF>=1.24            # faster PDF fallback; optional
 python-dotenv>=1.0

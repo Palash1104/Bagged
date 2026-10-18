@@ -69,6 +69,12 @@ def cmd_test_extract(args) -> int:
     return 0
 
 
+# Fallback for rows scored before the breakdown recorded firmness; same map as
+# extract/llm.py. ("work_order" can be 1.0 or the Reg-30 default 0.8.)
+_FIRMNESS_BY_TYPE = {"loa": 1.0, "work_order": 1.0, "loi": 0.6, "l1": 0.4,
+                     "mou": 0.3, "amendment": 0.0, "unknown": 0.5}
+
+
 def cmd_rescore(args) -> int:
     """Re-run scoring over stored orders after tweaking weights."""
     import json as _json
@@ -78,7 +84,12 @@ def cmd_rescore(args) -> int:
 
     n = 0
     with connect() as conn:
-        rows = conn.execute("SELECT * FROM orders ORDER BY filed_at").fetchall()
+        # seen_at: when the filing was first fetched, which staleness is
+        # measured against (score._penalties), so a rescore does not age orders
+        rows = conn.execute(
+            "SELECT o.*, a.fetched_at AS seen_at FROM orders o "
+            "LEFT JOIN announcements a ON a.ann_id = o.ann_id "
+            "ORDER BY o.filed_at").fetchall()
         for r in rows:
             o = dict(r)
             company = conn.execute(
@@ -92,6 +103,19 @@ def cmd_rescore(args) -> int:
             hist = company_order_history(conn, o["company_id"])
             hist = [h for h in hist if h != o.get("order_value_inr")]
             o["confidence"] = o.get("extraction_conf")
+            # Firmness and the order-mix keyword adjustment come from extraction
+            # and have no column of their own; the last score breakdown holds
+            # them. Without this every order re-scored at firmness 0.5 with no
+            # keyword bumps: an LOA lost 7.5 points plus a 22% cut to its size
+            # points (18 Oct: HIGH fell from 42 to 12 on a rescore).
+            try:
+                comps = _json.loads(o.get("score_breakdown") or "{}").get("components", {})
+            except ValueError:
+                comps = {}
+            firm = (comps.get("firmness") or {}).get("firmness")
+            o["firmness"] = firm if firm is not None else _FIRMNESS_BY_TYPE.get(
+                o.get("order_type") or "unknown", 0.5)
+            o["quality_adj"] = (comps.get("margin_quality") or {}).get("keyword_adj") or 0.0
             sr = score_order(o, funds, company, hist)
             conn.execute(
                 "UPDATE orders SET score=?, tier=?, score_breakdown=?, "
@@ -151,6 +175,15 @@ def cmd_recheck(args) -> int:
             if not order_like or not has_text:
                 continue
             st["checked"] += 1
+            if st["checked"] % 50 == 0:
+                # Short write transactions: a scheduled scan running alongside
+                # must not wait out the whole recheck for the database lock.
+                # Each filing is replayed independently, so a partial run is
+                # consistent, and Ctrl+C keeps what was done.
+                conn.commit()
+            if st["checked"] % 250 == 0:
+                print(f"  {st['checked']} filings checked "
+                      f"({st['dropped']} dropped, {st['created']} created)", flush=True)
 
             company = conn.execute("SELECT * FROM companies WHERE company_id=?",
                                    (a["company_id"],)).fetchone()
@@ -195,9 +228,11 @@ def cmd_recheck(args) -> int:
 
             conn.execute("UPDATE announcements SET is_order_like=1 WHERE ann_id=?",
                          (a["ann_id"],))
-            if not existed and not a.get("pdf_text") and a.get("pdf_url"):
-                # Classifies on headline/body, but the figure is in the PDF we
-                # never fetched. A scan with the probe enabled will collect it.
+            if not existed and not pdf_text and a.get("pdf_url"):
+                # Classifies on headline/body, but the figure is in a PDF that
+                # could not be read even now. (`pdf_text`, not the stored
+                # a["pdf_text"]: a PDF fetched just above counts, so one pass
+                # creates the order instead of needing a second recheck.)
                 st["need_pdf"] += 1
                 continue
 
@@ -215,6 +250,7 @@ def cmd_recheck(args) -> int:
             d = res.to_dict()
             d.update({"company_name": company.get("name"),
                       "exchange": a["exchange"], "filed_at": a["filed_at"],
+                      "seen_at": a.get("fetched_at"),
                       "extraction_conf": res.confidence})
             sr = score_order(d, funds, company, hist)
 
@@ -379,6 +415,126 @@ def cmd_fetch_pdfs(args) -> int:
     print(f"{len(urls)} order PDFs: {len(urls) - len(missing)} already cached, "
           f"{got} downloaded, {len(missing) - got} could not be fetched")
     return 0
+
+
+def cmd_orderbook(args) -> int:
+    """Reported order books, for the Orderbook view (/orderbook).
+
+        recheck   read every stored filing that mentions an order book (offline)
+        fetch     open results releases, investor presentations and order-book
+                  updates not read yet (downloads; never cached; resumable)
+        history   add BSE presentations / press releases older than the scan
+                  history, so growth can reach back a year; then run fetch
+        meta      market cap and last-FY revenue from screener.in
+        show SYM  every statement on record for one company
+    """
+    from . import orderbook as ob
+    from .db import connect, init_db
+    from .sources import company_meta
+
+    init_db()
+    act = args.action
+    with connect() as conn:
+        if act == "recheck":
+            st = ob.recheck(conn)
+            print(f"read {st['filings']} stored filings that mention an order book: "
+                  f"{st['with_book']} stated a figure, {st['snapshots']} figures kept; "
+                  f"{st['companies']} companies now have an order book")
+        elif act == "fetch":
+            todo = ob.candidates(conn, days=args.days, all_companies=args.all_companies,
+                                 limit=args.limit)
+            print(f"{len(todo)} filings to open "
+                  f"({'every company' if args.all_companies else 'companies Bagged tracks'}"
+                  f"{f', last {args.days} days' if args.days else ''})")
+            if args.dry_run:
+                from collections import Counter
+                print(dict(Counter(t["kind"] for t in todo)))
+                return 0
+            st = ob.fetch(conn, days=args.days, limit=args.limit,
+                          all_companies=args.all_companies,
+                          progress=lambda i, n, s: print(
+                              f"  {i}/{n}: {s['with_book']} with a book, "
+                              f"{s['failed']} failed downloads", flush=True))
+            print(f"opened {st['opened']}, {st['with_book']} stated an order book "
+                  f"({st['snapshots']} figures), {st['failed']} could not be downloaded")
+            if args.meta:
+                _orderbook_meta(conn, company_meta, max_age=CONFIG.company_meta_max_age_days)
+        elif act == "history":
+            st = ob.pull_history(conn, days=args.days or 400)
+            print(f"{st['new']} older filings added ({st['found']} seen in "
+                  f"{st['windows']} weekly windows). Now run: orderbook fetch")
+        elif act == "meta":
+            _orderbook_meta(conn, company_meta, max_age=0 if args.force else
+                            CONFIG.company_meta_max_age_days)
+        elif act == "show":
+            key = (args.symbol or "").upper()
+            co = conn.execute(
+                "SELECT * FROM companies WHERE upper(nse_symbol)=? OR bse_code=? OR company_id=? "
+                "OR upper(name) LIKE ? LIMIT 1", (key, key, key, f"%{key}%")).fetchone()
+            if not co:
+                print(f"no company matching {args.symbol!r}")
+                return 1
+            if args.refresh_meta:
+                company_meta.ensure(conn, dict(co), force=True)
+            f = conn.execute("SELECT * FROM fundamentals WHERE company_id=?",
+                             (co["company_id"],)).fetchone()
+            co = conn.execute("SELECT * FROM companies WHERE company_id=?",
+                              (co["company_id"],)).fetchone()
+            print(f"{co['name']}  NSE:{co['nse_symbol'] or '-'}  BSE:{co['bse_code'] or '-'}")
+            print(f"  market cap: {(co['market_cap_inr'] or 0) / 1e7:,.0f} Cr"
+                  f"   last FY revenue: {((f['last_fy_revenue_inr'] if f else 0) or 0) / 1e7:,.0f} Cr"
+                  f" (FY{(f['last_fy'] if f else None) or '-'}, "
+                  f"{(f['revenue_basis'] if f else None) or '-'})")
+            for r in conn.execute("SELECT * FROM orderbook WHERE company_id=? ORDER BY as_of",
+                                  (co["company_id"],)):
+                print(f"  {r['as_of']} ({r['as_of_basis']:<7}) {r['order_book_inr'] / 1e7:>12,.2f} Cr "
+                      f"{r['scope']:<10} c={r['confidence']:.2f} {r['source_kind']}")
+                print(f"      “{r['quote'][:150]}”")
+    return 0
+
+
+def cmd_bse_check(args) -> int:
+    """Ask BSE's announcement API for the last two days and say whether it answered."""
+    from .sources import bse
+    if args.probe:
+        print("Trying each way of calling BSE once (status 200 = works):\n")
+        works = False
+        for r in bse.probe():
+            got = (f"status {r['status']}" if r["status"] is not None else "no answer")
+            extra = ""
+            if r["rows"] is not None:
+                extra = f", {r['rows']} announcements"
+                works = True
+            if r["pdf"]:
+                extra += f", PDF download {r['pdf']}"
+            if r["error"]:
+                extra += f"  ({r['error']})"
+            print(f"  {r['strategy']:<26} {got}{extra}")
+        if not bse.have_chrome_transport():
+            print("\ncurl_cffi is not installed; it is the likely fix: pip install curl_cffi")
+        return 0 if works else 1
+    r = bse.check()
+    if r["ok"]:
+        print(f"BSE feed OK: {r['rows']} announcements on the first page "
+              f"(via {r['strategy']}).")
+        return 0
+    print(f"BSE feed DOWN: {r['error']}")
+    if r["refused"]:
+        print(f"refused (403): {', '.join(dict.fromkeys(r['refused']))}")
+    if not r["chrome_transport"]:
+        print("curl_cffi is not installed, so only python-requests was tried. "
+              "Install it: pip install curl_cffi")
+    print("Run 'bse-check --probe' for a per-method report.")
+    return 1
+
+
+def _orderbook_meta(conn, company_meta, max_age: int) -> None:
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM companies WHERE company_id IN (SELECT DISTINCT company_id FROM orderbook)")]
+    print(f"refreshing market cap and revenue for {len(rows)} companies (screener.in)...")
+    st = company_meta.refresh_many(conn, rows, max_age_days=max_age)
+    print(f"fetched {st['fetched']}, up to date {st['skipped']}; "
+          f"{st['with_mcap']} companies now have a market cap")
 
 
 def cmd_fundamentals(args) -> int:
@@ -555,6 +711,26 @@ def main(argv=None) -> int:
 
     fp = sub.add_parser("fetch-pdfs", help="cache every stored order's filing PDF")
     fp.set_defaults(func=cmd_fetch_pdfs)
+
+    ob = sub.add_parser("orderbook", help="reported order books (the Orderbook view)")
+    ob.add_argument("action", choices=["recheck", "fetch", "history", "meta", "show"])
+    ob.add_argument("symbol", nargs="?", help="for show: NSE symbol, BSE code or name")
+    ob.add_argument("--days", type=int, default=None,
+                    help="fetch: only filings from the last N days; history: how far back (default 400)")
+    ob.add_argument("--limit", type=int, default=None, help="fetch: open at most N filings")
+    ob.add_argument("--all-companies", action="store_true",
+                    help="fetch: every listed company, not only those Bagged tracks")
+    ob.add_argument("--dry-run", action="store_true", help="fetch: list what would be opened")
+    ob.add_argument("--no-meta", dest="meta", action="store_false",
+                    help="fetch: skip the market cap / revenue refresh afterwards")
+    ob.add_argument("--force", action="store_true", help="meta: refresh even if recent")
+    ob.add_argument("--refresh-meta", action="store_true", help="show: refetch market cap/revenue")
+    ob.set_defaults(func=cmd_orderbook, meta=True)
+
+    bc = sub.add_parser("bse-check", help="is BSE's announcement API answering?")
+    bc.add_argument("--probe", action="store_true",
+                    help="try every way of calling BSE and report each status code")
+    bc.set_defaults(func=cmd_bse_check)
 
     f = sub.add_parser("fundamentals", help="resolve revenue for one symbol")
     f.add_argument("symbol")

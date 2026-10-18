@@ -54,7 +54,12 @@ def from_screener(key: str) -> dict[int, dict]:
     except Exception as exc:
         log.debug("screener annuals %s failed: %s", key, exc)
         return {}
-    section = _SECTION.search(r.text)
+    return parse_annuals(r.text)
+
+
+def parse_annuals(page: str) -> dict[int, dict]:
+    """The annual profit-and-loss table of a screener.in company page."""
+    section = _SECTION.search(page)
     if not section:
         return {}
     rows = [[_text(c) for c in _CELL.findall(row)] for row in _ROW.findall(section.group(0))]

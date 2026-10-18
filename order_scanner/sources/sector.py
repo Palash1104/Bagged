@@ -33,7 +33,7 @@ import re
 import requests
 
 from ..config import CONFIG
-from .bse import API, HEADERS
+from .bse import API, shared_session
 
 log = logging.getLogger(__name__)
 
@@ -64,9 +64,9 @@ def from_screener(key: str) -> tuple[str | None, str | None]:
 
 def from_bse(bse_code: str) -> tuple[str | None, str | None]:
     try:
-        r = requests.get(f"{API}/ComHeadernew/w",
-                         params={"quotetype": "EQ", "scripcode": bse_code, "seriesid": ""},
-                         headers=HEADERS, timeout=CONFIG.request_timeout)
+        r = shared_session().get(f"{API}/ComHeadernew/w",
+                                 params={"quotetype": "EQ", "scripcode": bse_code, "seriesid": ""},
+                                 timeout=CONFIG.request_timeout)
         r.raise_for_status()
         data = r.json()
     except Exception as exc:  # network, non-JSON, unknown scrip

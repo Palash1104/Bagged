@@ -154,6 +154,14 @@ def main():
     print()
     print(f"size sweep, Rs2-80Cr vs Rs400Cr TTM: {sweep}")
 
+    # Staleness is how late the filing was FOUND, not how old it is now: a
+    # recheck or rescore days later must not age an order caught live.
+    def seen(after_h):
+        o = order(450, 12, age_h=120)
+        o["seen_at"] = (now_ist() - timedelta(hours=120 - after_h)).isoformat()
+        return score_order(o, funds(160, 600, 0.11, 1200), {}, [])
+    caught_live, found_late = seen(1), seen(72)
+
     checks = [
         ("6-month execution outscores 36-month",
          by["Same order, 6-month execution"].score
@@ -178,6 +186,10 @@ def main():
          by["No revenue data available, Rs180Cr LOA"].data_quality == "low"),
         ("stale filing is discounted",
          "stale" in by["Stale: Rs450Cr LOA filed 5 days ago"].penalties),
+        ("re-scoring days later does not make an order caught live stale",
+         "stale" not in caught_live.penalties),
+        ("an order first seen 3 days after filing stays stale on re-score",
+         "stale" in found_late.penalties),
         ("unstated execution period flagged as partial data",
          by["Same order, execution period not stated"].data_quality == "partial"),
         ("MoU never reaches HIGH tier",

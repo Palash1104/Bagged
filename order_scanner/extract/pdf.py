@@ -18,26 +18,62 @@ def cache_path(url: str):
     return PDF_CACHE / (hashlib.sha1(url.encode()).hexdigest() + ".pdf")
 
 
-def download_pdf(session, url: str) -> bytes | None:
+def download_pdf(session, url: str, cache: bool = True) -> bytes | None:
+    """The PDF at `url`, from the local cache when it is there.
+
+    cache=False still READS the cache but never writes to it: the order-book
+    reader opens hundreds of presentations it needs once, and keeping them
+    would add gigabytes for nothing.
+
+    BSE moves attachments from AttachLive to AttachHis two to three weeks after
+    filing, and the old link then answers 404 (checked 18 Oct 2026: 11-14 Aug
+    and some 30 Sep filings 404 on AttachLive, 200 on AttachHis). So a failed
+    AttachLive link is retried on AttachHis. The cache stays keyed on the URL
+    as stored, so later reads find the file whichever folder it came from.
+    """
     if not url or not CONFIG.download_pdfs:
         return None
     path = cache_path(url)
     if path.exists():
         return path.read_bytes()
+    urls = [url]
+    if "/AttachLive/" in url:
+        urls.append(url.replace("/AttachLive/", "/AttachHis/"))
+    for i, u in enumerate(urls):
+        content = _fetch_pdf(session, u, quiet=i + 1 < len(urls))
+        if content:
+            if cache:
+                path.write_bytes(content)
+            return content
+    return None
+
+
+def _fetch_pdf(session, url: str, quiet: bool = False) -> bytes | None:
+    """One download attempt. `quiet` keeps a failure out of the log when
+    another URL is still to be tried."""
     try:
         r = session.get(url, timeout=CONFIG.request_timeout, stream=True)
         r.raise_for_status()
+        limit = CONFIG.max_pdf_mb * 1024 * 1024
         size = int(r.headers.get("content-length") or 0)
-        if size and size > CONFIG.max_pdf_mb * 1024 * 1024:
+        if size and size > limit:
             log.info("skipping oversized pdf (%.1f MB): %s", size / 1e6, url)
+            r.close()
             return None
-        content = r.content
-        if not content.startswith(b"%PDF"):
-            return None
-        path.write_bytes(content)
-        return content
+        # Read the stream chunk by chunk. `r.content` is empty on a streamed
+        # curl_cffi response (the BSE session uses curl_cffi since 18 Oct), and
+        # this also enforces the size cap when the server sends no length.
+        buf = bytearray()
+        for chunk in r.iter_content(chunk_size=65536):
+            buf.extend(chunk)
+            if len(buf) > limit:
+                log.info("skipping oversized pdf (> %d MB): %s", CONFIG.max_pdf_mb, url)
+                r.close()
+                return None
+        content = bytes(buf)
+        return content if content.startswith(b"%PDF") else None
     except Exception as exc:
-        log.warning("pdf download failed %s: %s", url, exc)
+        (log.debug if quiet else log.warning)("pdf download failed %s: %s", url, exc)
         return None
 
 

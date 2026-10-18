@@ -185,6 +185,38 @@ def main():
     except Exception as exc:
         checks.append((f"dashboard query failed: {exc}", False))
 
+    # A rescore with nothing changed must change nothing. It used to drop every
+    # order to firmness 0.5 with no keyword bumps (neither has a column), and
+    # to age every order past 48h into the stale penalty.
+    import contextlib
+    import io
+
+    from order_scanner import cli
+    from order_scanner.db import upsert
+    with connect() as conn:
+        # the scan's fundamentals were stubbed in memory; rescore reads the table
+        for cid, f in FUNDS.items():
+            f = dict(f)
+            mcap = f.pop("market_cap_inr")
+            upsert(conn, "fundamentals", {"company_id": cid, **f}, "company_id")
+            conn.execute("UPDATE companies SET market_cap_inr=? WHERE company_id=?", (mcap, cid))
+        before = {r["order_id"]: (r["score"], r["tier"])
+                  for r in conn.execute("SELECT order_id, score, tier FROM orders")}
+        # pretend the filings were scored three days ago
+        conn.execute("UPDATE orders SET filed_at = datetime(filed_at, '-3 days')")
+        conn.execute("UPDATE announcements SET filed_at = datetime(filed_at, '-3 days'), "
+                     "fetched_at = datetime(fetched_at, '-3 days')")
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.cmd_rescore(None)
+    with connect() as conn:
+        after = {r["order_id"]: (r["score"], r["tier"])
+                 for r in conn.execute("SELECT order_id, score, tier FROM orders")}
+    changed = {k: (before[k], after.get(k)) for k in before if before[k] != after.get(k)}
+    if changed:
+        print("rescore changed:", changed)
+    checks.append(("rescore days later leaves every score and tier as it was",
+                   not changed))
+
     print(f"\n{'CHECKS':-^78}")
     failed = 0
     for label, ok in checks:

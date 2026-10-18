@@ -111,6 +111,14 @@ to re-score the whole stored history and see what the change would have done.
 | Quarterly revenue | `nseindia.com/api/results-comparision` (official, reported in ₹ lakhs) | yfinance `.NS`/`.BO` quarterly income statement |
 | Manual override | `data/manual_fundamentals.csv` — always wins | — |
 
+**BSE refuses python-requests (since 30 Sep 2026).** BSE's bot filter answers
+403 to Python's own HTTP client whatever its headers, while Chrome on the same
+PC gets 200 from the same API. Bagged therefore calls BSE through `curl_cffi`,
+which makes the connection look like Chrome's, and falls back through a cookie
+warm-up and plain `requests` if that is ever refused. `bse-check` says whether
+BSE is answering; `bse-check --probe` tries each method once and prints its
+status code. Three failed runs in a row send one Telegram warning a day.
+
 NSE needs a cookie handshake and re-bootstraps automatically on 401/403. The
 manual CSV takes columns `key,q_revenue_cr,ttm_revenue_cr,ebitda_margin,market_cap_cr,latest_quarter`
 where `key` is an NSE symbol, BSE code or ISIN — use it for anything the APIs
@@ -193,6 +201,45 @@ http://127.0.0.1:8765 is always up. It listens on this PC only. To restart it:
 
 ---
 
+## Orderbook view
+
+`http://127.0.0.1:8000/orderbook` — or the **Order book** button in the top bar
+of the orders page. One row per company: the latest order book the company
+reported, growth over 3M / 6M / 1Y / all, last full-year revenue, book-to-revenue,
+market cap, the date the book is stated as of, when it was last updated, a
+history sparkline, and the order wins Bagged recorded in the same period. A
+top-gainers strip sits above the table; columns can be hidden; clicking a
+company shows the history chart and **every sentence each figure was read
+from**, with a link to the filing PDF.
+
+**Where the numbers come from.** An order book is *not* the sum of the order
+wins on record: book = opening book + new orders − revenue executed, and Bagged
+only sees the announced part of "new orders". So the figure is read from what
+companies state themselves — order-win releases ("the total unexecuted order
+book stands at Rs 4,100 crore"), results releases, investor presentations,
+earnings call transcripts and monthly order-position updates. Each figure keeps
+its as-of date (stated, or inferred as the last quarter end for a results
+release that gives none), and whether it is the whole company's book or one
+segment's/subsidiary's. Segment-only companies are marked and can be hidden.
+
+**Setting it up (once):**
+
+```bat
+python -m order_scanner.cli orderbook recheck              :: from filings already stored (offline, seconds)
+python -m order_scanner.cli orderbook fetch --dry-run      :: how many PDFs it would open
+python -m order_scanner.cli orderbook fetch                :: open them (resumable; Ctrl+C and rerun is fine)
+python -m order_scanner.cli orderbook history --days 400   :: optional: older presentations, for 1Y growth
+python -m order_scanner.cli orderbook fetch                :: read those too
+```
+
+`fetch` also refreshes market cap and last-FY revenue from screener.in when it
+finishes (`orderbook meta` does only that). After setup, the scheduled scan
+keeps it current by itself: it reads the book out of every order-win release,
+and opens up to 25 results releases / presentations per run for companies
+Bagged tracks. Those PDFs are read and discarded — never added to `pdf_cache`.
+
+`orderbook show GPTINFRA` prints every statement on record for one company.
+
 ## Commands
 
 ```
@@ -205,15 +252,20 @@ resummarize     rebuild the one-line order descriptions from stored filing text
 sectors         look up company industry labels (screener.in, BSE, yfinance); --all to refresh
 fetch-pdfs      cache every stored order's filing PDF for the dashboard
 fundamentals    resolve revenue for one symbol
+orderbook       reported order books: recheck | fetch | history | meta | show SYM
+bse-check       is BSE answering?  --probe: status code for each way of calling it
 config          print effective config
 ```
 
 ## Tests
 
 ```bat
-python tests\test_extract.py         :: 20 extraction cases
+python tests\test_extract.py         :: 71 extraction cases
 python tests\test_score.py           :: 23 scoring invariants
-python tests\test_pipeline_smoke.py  :: 22 end-to-end checks, network stubbed
+python tests\test_pipeline_smoke.py  :: 23 end-to-end checks, network stubbed
+python tests\test_orderbook.py       :: 47 order-book cases from real filings
+python tests\test_orderbook_smoke.py :: 16 order-book checks, scan to dashboard
+python tests\test_bse_feed.py        :: 23 BSE client checks: 403 fallbacks, probe, PDF streaming, feed-down warning
 ```
 
 ---
@@ -227,10 +279,11 @@ python tests\test_pipeline_smoke.py  :: 22 end-to-end checks, network stubbed
 - **Execution period is often unstated.** The model assumes 18 months and flags
   `data_quality: partial` when it does. Component A is sensitive to this, so
   check the flag before acting on a borderline score.
-- **Order-book context is missing.** A ₹200 Cr order against an existing
-  ₹5,000 Cr book is incremental, but neither exchange publishes order books in a
-  machine-readable form. The `orders` table is the substitute — after a few
-  months it approximates each company's intake run-rate.
+- **Order books are read, not published.** Neither exchange publishes order
+  books in a machine-readable form, so the Orderbook view reads them from the
+  companies' own text. Slide tables listing several quarters side by side are
+  skipped rather than guessed at, so a company that states its book only in
+  such a table will be missing. Every figure links to its sentence and PDF.
 - **FX rates are static** in `.env`. Fine for order sizing, not for anything
   needing precision.
 - Nothing here is investment advice; it's a screening tool that surfaces filings

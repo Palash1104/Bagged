@@ -15,6 +15,8 @@ from .extract.pdf import download_pdf, pdf_to_text
 from .extract.reg30 import parse_reg30
 from .extract.rules import (extract, is_non_order, looks_like_order,
                             norm_company_name, worth_pdf_probe)
+from . import orderbook as ob
+from .sources import company_meta
 from .score import score_order
 from .sources import bse as bse_src
 from .sources import fundamentals as fund_src
@@ -127,8 +129,16 @@ def _duplicate_order_id(conn, company_id: str, value, filed_at,
     return row["order_id"] if row else None
 
 
+# Per-exchange outcome of the last collect(): None = fine, else why it failed.
+# BSE answered 403 to every call from 30 Sep to 18 Oct 2026 and nothing said
+# so outside scan.log; run_scan records this in `runs.errors` and warns on
+# Telegram when it persists (see _warn_if_feed_down).
+FEED_DOWN: dict[str, str | None] = {}
+
+
 def collect(from_dt: datetime, to_dt: datetime, deep: bool = False) -> list[dict]:
     records: list[dict] = []
+    FEED_DOWN.clear()
     if CONFIG.scan_nse:
         try:
             client = nse_src.NSEClient()
@@ -136,13 +146,51 @@ def collect(from_dt: datetime, to_dt: datetime, deep: bool = False) -> list[dict
                 client, from_dt, to_dt, include_sme=CONFIG.include_sme)
         except Exception as exc:
             log.error("NSE collection failed: %s", exc)
+            FEED_DOWN["NSE"] = str(exc)[:160]
     if CONFIG.scan_bse:
         try:
-            records += bse_src.fetch_window(
-                bse_src.BSEClient(), from_dt, to_dt, deep=deep)
+            client = bse_src.BSEClient()
+            records += bse_src.fetch_window(client, from_dt, to_dt, deep=deep)
+            if getattr(client, "dead", False):
+                FEED_DOWN["BSE"] = client.last_error or "every request failed"
         except Exception as exc:
             log.error("BSE collection failed: %s", exc)
+            FEED_DOWN["BSE"] = str(exc)[:160]
     return records
+
+
+FEED_WARNING_MARK = "feed_warning.txt"
+
+
+def _warn_if_feed_down(conn, dry_run: bool) -> None:
+    """Telegram warning when an exchange feed has failed three runs running.
+    At most one warning a day, so a long outage does not flood the chat."""
+    from .config import DATA_DIR
+    rows = conn.execute("SELECT errors FROM runs ORDER BY run_id DESC LIMIT 3").fetchall()
+    if len(rows) < 3:
+        return
+    down = [ex for ex in ("BSE", "NSE")
+            if all(f"{ex} feed down" in (r["errors"] or "") for r in rows)]
+    if not down or dry_run:
+        return
+    mark = DATA_DIR / FEED_WARNING_MARK
+    try:
+        if mark.exists() and (now_ist().timestamp() - mark.stat().st_mtime) < 86400:
+            return
+    except OSError:
+        pass
+    ok, err = send_telegram(
+        "\u26a0\ufe0f <b>Bagged: " + " and ".join(down) + " feed down</b>\n"
+        "Every request to the exchange failed in the last 3 scans, so orders "
+        "filed there are being missed. Check data\\scan.log, then run "
+        "<code>python -m order_scanner.cli bse-check</code>.")
+    if ok:
+        try:
+            mark.write_text(now_ist().isoformat())
+        except OSError:
+            pass
+    else:
+        log.warning("feed-down warning not sent: %s", err)
 
 
 def _catch_up_start(to_dt: datetime) -> datetime | None:
@@ -170,11 +218,14 @@ def run_scan(lookback_minutes: int | None = None, force: bool = False,
              deep: bool = False, dry_run: bool = False,
              from_dt: datetime | None = None,
              to_dt: datetime | None = None,
-             probe_pdfs: bool | None = None) -> dict:
+             probe_pdfs: bool | None = None,
+             orderbook_probe: bool | None = None) -> dict:
     init_db()
     started = now_ist()
     if probe_pdfs is None:
         probe_pdfs = CONFIG.probe_generic_pdfs
+    if orderbook_probe is None:
+        orderbook_probe = CONFIG.orderbook_probe
 
     if not market_hours_ok(force):
         log.info("outside scan window; skipping (use --force to override)")
@@ -195,11 +246,15 @@ def run_scan(lookback_minutes: int | None = None, force: bool = False,
     log.info("scanning %s -> %s", from_dt.isoformat(), to_dt.isoformat())
     records = collect(from_dt, to_dt, deep=deep)
     log.info("fetched %d announcements", len(records))
+    feed_errors = [f"{ex} feed down: {why}" for ex, why in FEED_DOWN.items() if why]
+    for e in feed_errors:
+        log.error(e)
 
     stats = {"n_announcements": len(records), "n_order_like": 0,
              "n_extracted": 0, "n_alerts": 0, "llm_calls": 0,
              "n_non_order": 0, "n_duplicates": 0,
-             "n_pdf_probes": 0, "n_probe_hits": 0, "errors": []}
+             "n_pdf_probes": 0, "n_probe_hits": 0,
+             "n_orderbook_reads": 0, "n_orderbooks": 0, "errors": list(feed_errors)}
     watch_rows: list[dict] = []
 
     with connect() as conn:
@@ -214,6 +269,7 @@ def run_scan(lookback_minutes: int | None = None, force: bool = False,
         log.info("%d new (%d already seen)", len(fresh), len(records) - len(fresh))
 
         pdf_session = bse_src.BSEClient().s
+        tracked = ob.tracked_company_ids(conn) if CONFIG.orderbook_tracked_only else None
 
         for rec in fresh:
             try:
@@ -278,6 +334,8 @@ def run_scan(lookback_minutes: int | None = None, force: bool = False,
 
                 if not order_like:
                     upsert(conn, "announcements", ann_row, "ann_id")
+                    _read_order_book(conn, ann_row, rec, company, pdf_text, pdf_session,
+                                     orderbook_probe, tracked, stats)
                     continue
 
                 stats["n_order_like"] += 1
@@ -291,6 +349,10 @@ def run_scan(lookback_minutes: int | None = None, force: bool = False,
                 if pdf_text:
                     ann_row["pdf_text"] = pdf_text[:40000]
                 upsert(conn, "announcements", ann_row, "ann_id")
+                # Order-win releases often restate the order book ("the total
+                # unexecuted order book stands at..."): free, from text in hand.
+                _read_order_book(conn, ann_row, rec, company, None, pdf_session,
+                                 False, tracked, stats)
 
                 result = extract(rec.get("headline"), rec.get("body"), pdf_text,
                                  company_name=company["name"],
@@ -327,6 +389,7 @@ def run_scan(lookback_minutes: int | None = None, force: bool = False,
                     "filed_at": ann_row["filed_at"],
                     "pdf_url": rec.get("pdf_url"),
                     "extraction_conf": result.confidence,
+                    "seen_at": ann_row["fetched_at"],      # staleness, see score._penalties
                 })
 
                 sr = score_order(order_dict, funds, company, history)
@@ -412,9 +475,47 @@ def run_scan(lookback_minutes: int | None = None, force: bool = False,
              stats["n_announcements"], stats["n_order_like"],
              stats["n_extracted"], stats["n_alerts"], stats["llm_calls"],
              json.dumps(stats["errors"][:20])))
+        if feed_errors:
+            _warn_if_feed_down(conn, dry_run)
 
     log.info("run complete: %s", stats)
     return stats
+
+
+def _read_order_book(conn, ann_row: dict, rec: dict, company: dict, pdf_text,
+                     pdf_session, probe: bool, tracked, stats: dict) -> None:
+    """Record any order book this filing states.
+
+    Text already in hand (headline, body, the PDF if fetched) is always read.
+    For results releases, investor presentations and order-book updates the
+    PDF is opened as well -- budgeted, never cached, and only for companies
+    Bagged tracks -- since that is where the book is usually stated.
+    """
+    try:
+        text = "\n\n".join(x for x in (ann_row.get("headline"), ann_row.get("body"),
+                                         ann_row.get("pdf_text") or pdf_text) if x)
+        opened = bool(ann_row.get("pdf_text") or pdf_text)
+        if (probe and not opened and rec.get("pdf_url")
+                and stats["n_orderbook_reads"] < CONFIG.max_orderbook_probes_per_run
+                and ob.is_candidate(rec.get("category"), rec.get("subcategory"),
+                                    rec.get("headline"))
+                and (tracked is None or company["company_id"] in tracked)):
+            stats["n_orderbook_reads"] += 1
+            kind = ob.classify_source(rec.get("category"), rec.get("subcategory"),
+                                      rec.get("headline"))
+            pdf, _ = ob._pdf_text(pdf_session, rec["pdf_url"], kind)
+            if pdf:
+                text = "\n\n".join(x for x in (ann_row.get("headline"), pdf) if x)
+                opened = True
+        if not opened and not any(m in text.lower() for m in ob.MENTIONS):
+            return
+        n = ob.record_filing(conn, ann_row, text, "pdf" if opened else "stored-text",
+                             pdf_was_read=opened)
+        if n:
+            stats["n_orderbooks"] += n
+            company_meta.ensure(conn, company)
+    except Exception as exc:          # never let the order book break a scan
+        log.warning("order book read failed for %s: %s", company.get("name"), exc)
 
 
 def backfill(days: int = 30, deep: bool = True,
@@ -433,7 +534,8 @@ def backfill(days: int = 30, deep: bool = True,
         day_from = day_to - timedelta(days=1)
         log.info("backfill day %s", day_from.date())
         s = run_scan(force=True, deep=deep, dry_run=True,
-                     from_dt=day_from, to_dt=day_to, probe_pdfs=probe_pdfs)
+                     from_dt=day_from, to_dt=day_to, probe_pdfs=probe_pdfs,
+                     orderbook_probe=False)
         for k in totals:
             totals[k] += s.get(k, 0)
     return totals

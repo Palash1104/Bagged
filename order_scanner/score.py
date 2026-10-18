@@ -300,8 +300,21 @@ def _guidance(items, fundamentals, filed_at) -> tuple[float, dict]:
 
 
 # ---------------------------------------------------------------- penalties
+def _as_ist(value) -> datetime | None:
+    try:
+        dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=IST) if dt.tzinfo is None else dt
+
+
 def _penalties(order_value, market_cap, is_sme, is_related_party,
-               filed_at) -> tuple[float, dict]:
+               filed_at, seen_at=None) -> tuple[float, dict]:
+    """`seen_at` is when Bagged first fetched the filing. Staleness is measured
+    up to then, not up to now: an order is old news if it was FOUND late, and
+    that does not change when it is re-scored. Measured against now, every
+    `recheck` or `rescore` made every order older than two days stale -- on
+    18 Oct a recheck cut HIGH from 42 orders to 3."""
     p = CONFIG.penalties
     mult, applied = 1.0, {}
 
@@ -318,17 +331,12 @@ def _penalties(order_value, market_cap, is_sme, is_related_party,
         mult *= p.related_party_customer
         applied["related_party"] = p.related_party_customer
 
-    if filed_at:
-        try:
-            dt = (filed_at if isinstance(filed_at, datetime)
-                  else datetime.fromisoformat(str(filed_at)))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=IST)
-            if now_ist() - dt > timedelta(hours=p.stale_hours):
-                mult *= p.stale_announcement
-                applied["stale"] = p.stale_announcement
-        except (ValueError, TypeError):
-            pass
+    filed = _as_ist(filed_at) if filed_at else None
+    if filed:
+        seen = (_as_ist(seen_at) if seen_at else None) or now_ist()
+        if seen - filed > timedelta(hours=p.stale_hours):
+            mult *= p.stale_announcement
+            applied["stale"] = p.stale_announcement
 
     return mult, applied
 
@@ -400,7 +408,8 @@ def score_order(order: dict, fundamentals: dict | None, company: dict,
 
     mult, applied = _penalties(
         value, mcap, bool(company.get("is_sme")),
-        bool(order.get("is_related_party")), order.get("filed_at"))
+        bool(order.get("is_related_party")), order.get("filed_at"),
+        order.get("seen_at"))
 
     # Believability gate. The pump penalties above only fire when market cap
     # is known, and for the BSE-only smallcaps where this matters most it

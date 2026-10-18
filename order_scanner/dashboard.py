@@ -232,9 +232,128 @@ def api_stats():
     })
 
 
+# --------------------------------------------------------------------------
+# Orderbook view.
+#
+# Reported order books, one row per company: the latest figure the company
+# stated, its history, growth over the chosen period, and the context to
+# judge it by (last full-year revenue, market cap, order wins Bagged recorded
+# in the same period). See order_scanner/orderbook.py for how figures are
+# collected and extract/orderbook.py for how they are read.
+# --------------------------------------------------------------------------
+@app.get("/api/orderbook")
+def api_orderbook(period: str = "1y"):
+    from datetime import timedelta
+
+    from . import orderbook as ob
+    from .db import now_ist
+
+    period = period if period in ob.PERIOD_DAYS else "1y"
+    snaps = _rows("SELECT * FROM orderbook ORDER BY as_of")
+    by_co: dict[str, list[dict]] = {}
+    for sn in snaps:
+        by_co.setdefault(sn["company_id"], []).append(sn)
+    if not by_co:
+        return JSONResponse({"rows": [], "period": period, "n_snapshots": 0})
+
+    ids = tuple(by_co)
+    marks = ",".join("?" * len(ids))
+    cos = {c["company_id"]: c for c in _rows(f"SELECT * FROM companies WHERE company_id IN ({marks})", ids)}
+    funds = {f["company_id"]: f for f in _rows(f"SELECT * FROM fundamentals WHERE company_id IN ({marks})", ids)}
+
+    cutoff = (now_ist() - timedelta(days=ob.PERIOD_DAYS[period])).isoformat()
+    wins_rows = _collapse_cross_exchange(_rows(
+        f"SELECT * FROM orders WHERE is_amendment = 0 AND filed_at >= ? AND company_id IN ({marks}) "
+        f"ORDER BY filed_at DESC", (cutoff, *ids)))
+    wins: dict[str, list] = {}
+    for w in wins_rows:
+        wins.setdefault(w["company_id"], []).append(w)
+
+    out = []
+    for cid, cs in by_co.items():
+        series, scope = ob.build_series(cs)
+        if not series:
+            continue
+        last = series[-1]
+        c, f = cos.get(cid, {}), funds.get(cid, {})
+        revenue = f.get("last_fy_revenue_inr") or f.get("ttm_revenue_inr")
+        rev_label = (f"FY{f['last_fy']}" + (f", {f['revenue_basis']}" if f.get("revenue_basis") else "")
+                     if f.get("last_fy_revenue_inr") and f.get("last_fy") else
+                     ("trailing 12 months" if f.get("ttm_revenue_inr") else None))
+        g = ob.growth(series, period)
+        w = wins.get(cid, [])
+        out.append({
+            "company_id": cid,
+            "name": c.get("name") or last.get("company_id"),
+            "nse_symbol": c.get("nse_symbol"), "bse_code": c.get("bse_code"),
+            "industry": c.get("industry"), "sector": c.get("sector"),
+            "order_book": last["order_book_inr"],
+            "as_of": last["as_of"], "as_of_basis": last["as_of_basis"],
+            "is_approx": bool(last["is_approx"]),
+            "scope": scope,
+            "flags": last.get("flags"),
+            "growth": g["pct"] if g else None,
+            "growth_from": g["from_as_of"] if g else None,
+            "growth_days": g["days"] if g else None,
+            # a step of 4x or more on the way: shown with a check mark, kept
+            # out of the top gainers (see orderbook.SUSPECT_STEP)
+            "growth_suspect": bool(g and g["suspect"]),
+            "revenue": revenue, "revenue_label": rev_label,
+            "book_to_revenue": (last["order_book_inr"] / revenue) if revenue else None,
+            "market_cap": c.get("market_cap_inr"),
+            "last_updated": max((sn["filed_at"] or "") for sn in cs),
+            "history": [{"as_of": sn["as_of"], "v": sn["order_book_inr"]} for sn in series[-12:]],
+            "n_points": len(series),
+            "wins_value": sum(x.get("order_value_inr") or 0 for x in w),
+            "wins_count": len(w),
+        })
+    return JSONResponse({"rows": out, "period": period, "n_snapshots": len(snaps)})
+
+
+@app.get("/api/orderbook/{company_id}")
+def api_orderbook_company(company_id: str):
+    """Every order-book statement on record for one company, with its evidence."""
+    snaps = _rows(
+        "SELECT ob.*, a.headline, a.pdf_url FROM orderbook ob "
+        "LEFT JOIN announcements a ON a.ann_id = ob.ann_id "
+        "WHERE ob.company_id = ? ORDER BY ob.as_of DESC, ob.filed_at DESC", (company_id,))
+    return JSONResponse({
+        "company": (_rows("SELECT * FROM companies WHERE company_id=?", (company_id,)) or [{}])[0],
+        "fundamentals": (_rows("SELECT * FROM fundamentals WHERE company_id=?", (company_id,)) or [{}])[0],
+        "snapshots": snaps,
+        "wins": _collapse_cross_exchange(_rows(
+            "SELECT * FROM orders WHERE company_id=? AND is_amendment=0 ORDER BY filed_at DESC LIMIT 60",
+            (company_id,))),
+    })
+
+
+@app.get("/api/annpdf/{ann_id}")
+def api_annpdf(ann_id: str):
+    """Any filing's PDF: from the local cache if it is there, otherwise the
+    exchange's own link. Nothing is downloaded or cached here."""
+    from .extract.pdf import cache_path
+    rows = _rows("SELECT company_name, filed_at, exchange, pdf_url FROM announcements "
+                 "WHERE ann_id = ?", (ann_id,))
+    if not rows or not rows[0].get("pdf_url"):
+        return JSONResponse({"error": "no PDF on record for this filing"}, status_code=404)
+    r = rows[0]
+    path = cache_path(r["pdf_url"])
+    if path.exists():
+        name = re.sub(r"[^A-Za-z0-9]+", "-",
+                      f"{r['company_name']} {(r['filed_at'] or '')[:10]} {r['exchange'] or ''}")
+        return Response(path.read_bytes(), media_type="application/pdf",
+                        headers={"Content-Disposition": f'inline; filename="{name.strip("-")}.pdf"'})
+    return RedirectResponse(r["pdf_url"])
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return PAGE
+
+
+@app.get("/orderbook", response_class=HTMLResponse)
+def orderbook_page():
+    return ORDERBOOK_PAGE
 
 
 # --------------------------------------------------------------------------
@@ -434,6 +553,14 @@ h1{font-size:15px;line-height:1.2;margin:0;font-weight:650;letter-spacing:-.01em
   box-shadow:inset 0 1px 0 rgba(255,255,255,.2),0 1px 2px rgba(0,0,0,.12),
     0 6px 14px -10px rgba(0,0,0,.45)}
 .seg button:focus-visible,.chips button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+
+/* view switch: Orders | Order book */
+.views a{color:var(--ink-3);font-size:12.5px;font-weight:550;padding:5px 13px;border-radius:9px;
+  text-decoration:none;line-height:1.5;transition:color .15s,background .15s}
+.views a:hover{color:var(--ink);text-decoration:none}
+.views a[aria-current=page]{color:var(--ink);background:var(--glass-hi);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.2),0 1px 2px rgba(0,0,0,.12),0 6px 14px -10px rgba(0,0,0,.45)}
+.views a:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 
 /* ---------------------------------------------------------------- filters */
 .bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:14px 0 0;padding:10px 12px}
@@ -687,6 +814,9 @@ table.inner tr.cur td:last-child{border-radius:0 9px 9px 0}
       <span class="logo" aria-hidden="true"><span class="cube"><i></i><i></i><i></i><i></i><i></i><i></i></span></span>
       <div><h1>Order Scanner</h1><div class="tag">NSE · BSE order wins</div></div>
     </div>
+    <nav class="seg views" aria-label="View">
+      <a href="/" aria-current="page">Orders</a><a href="/orderbook">Order book</a>
+    </nav>
     <span class="spacer"></span>
     <span class="since" id="since"></span>
     <div class="seg" id="theme" role="group" aria-label="Colour theme">
@@ -1078,8 +1208,14 @@ load();
 """
 
 
+from .orderbook_page import render as _render_orderbook  # noqa: E402
+
+ORDERBOOK_PAGE = _render_orderbook(re.search(r"<style>(.*?)</style>", PAGE, re.S).group(1))
+
+
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     import uvicorn
     init_db()
     print(f"Order Scanner dashboard -> http://{host}:{port}  (db: {DB_PATH})")
+    print(f"Orderbook view         -> http://{host}:{port}/orderbook")
     uvicorn.run(app, host=host, port=port, log_level="warning")

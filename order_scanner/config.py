@@ -185,6 +185,22 @@ class Config:
     llm_api_key: str = os.getenv("ANTHROPIC_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
     llm_max_calls_per_run: int = 40   # cost guard
 
+    # --- order book (the Orderbook view) ------------------------------
+    # Each live scan opens the PDFs of a few results releases, investor
+    # presentations and order-book updates to read the company's reported
+    # order book. Those PDFs are read and discarded, not cached. Backfill
+    # skips this; `orderbook fetch` does it in bulk afterwards.
+    orderbook_probe: bool = True
+    max_orderbook_probes_per_run: int = 25
+    orderbook_max_pages: int = 40      # presentations put the book on slide 3-15
+    orderbook_min_confidence: float = 0.45
+    # Read order books only for companies Bagged has seen win an order (or
+    # already holds a book for). False widens it to every listed company,
+    # which costs roughly ten times the downloads.
+    orderbook_tracked_only: bool = True
+    fetch_company_meta: bool = True    # market cap + last-FY revenue from screener.in
+    company_meta_max_age_days: int = 7
+
     # --- fx (used when an order is quoted in a foreign currency) ------
     fx_rates: dict = field(default_factory=lambda: {
         "INR": 1.0,

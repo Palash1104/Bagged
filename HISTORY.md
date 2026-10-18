@@ -1,0 +1,182 @@
+# Bagged — decision log and incidents
+
+This file records why things are the way they are. It is newest last. Each
+entry gives the problem, what was found and what changed. Read it before
+"fixing" a rule that looks odd: most rules exist because of a specific real
+filing. Longer write-ups of most rounds are in the claude.ai Project "Order
+Scanner" (`claude/*.md`).
+
+---
+
+## 12 Sep 2026 — first build
+
+The user asked for a scanner of NSE and BSE announcements that flags orders
+of at least 50% of the latest quarter's revenue. It should store every order,
+even those below the bar, and the user was open to better logic.
+
+Choices made:
+- scheduled batches, not a polling loop;
+- alerts via Telegram plus a local dashboard;
+- extraction regex-first with an LLM fallback;
+- a tiered composite score (0–100) instead of the flat 50% rule.
+
+**Why not the flat 50% rule:**
+- It ignores the execution period: ₹500 Cr over 5 years is not the same as
+  over 6 months.
+- It ignores firmness: an MoU is a press release, not an order.
+- It ignores the company's base rate: a serial announcer's 30th ₹20 Cr order
+  is not news.
+
+The 50% rule survives as component B (20 points) and as an always-alert
+override. The override never fires when a penalty applied, because otherwise
+it promotes exactly the micro-cap pump filings the penalties catch.
+
+**Data sources:**
+- BSE `AnnSubCategoryGetData`. It has a dedicated subcategory, "Award of
+  Order / Receipt of Order", which is pulled first; then Company Update and
+  Others are swept for stragglers.
+- NSE `corporate-announcements`, which needs a cookie bootstrap.
+- Revenue: NSE results API (in ₹ lakhs), then yfinance, then
+  `data/manual_fundamentals.csv`.
+
+## 12 Sep — precision round (first 2-day backfill: 68 orders, 4 of 5 alerts wrong)
+
+The wrong alerts:
+- a broker parsed as its own customer;
+- a CRISIL rating release, where the "order" was the rated bank facility;
+- a financial-services firm;
+- a garbled customer name.
+
+The fixes:
+- `is_non_order()` drops regulatory, court, tax, exchange and insolvency
+  "orders", rating releases and rumour verifications. It matches on the
+  **headline/subcategory only**, because real order PDFs contain that
+  boilerplate.
+- Customer sanity checks. When the only counterparty found is the company
+  itself, the order is flagged related-party.
+- Believability gate: an order above 25× quarterly revenue is treated as a
+  misparse, held at WATCH and cannot alert.
+- Companies are merged across exchanges on ISIN, then normalised name.
+- Duplicate alerts are suppressed (same value within 0.5%, within 3 days).
+
+## 12 Sep — recall round
+
+- **The plural bug:** `\b(?:order|contract)\b` cannot match "orders". BSE's
+  most on-target headline, "Bagging/Receiving of orders/contracts", was
+  missed (~6 filings a day). Every filing noun now carries `s?`.
+- The execution period is read from the Reg-30 table label, and word
+  numbers are parsed ("Eighteen Months"). Coverage went from 9/60 to 26/60.
+- A bare value in the Reg-30 cell ("Size of the order 4,23,00,000") is read
+  only when a value label sits right in front of it.
+- **The PDF probe.** Headlines like "General Updates" and "Press Release"
+  carry the order only in the attached PDF. The probe fetches those PDFs and
+  re-classifies the text. It is on for `scan` and off for `backfill`, because
+  of bandwidth.
+- Dashboard: a company drill-down showing the full order history.
+
+## 12 Sep — own-project capex is not an order (Accuracy Shipping)
+
+The filing announced a "Letter of Intent from CBIC for setting up a Container
+Freight Station". That is a licence for the company's own capex. The scanner
+reported ₹187.50 Cr, the midpoint of the *projected* peak revenue, and it
+scored MEDIUM.
+
+- **Fix:** `OWN_PROJECT_PATTERNS`, which needs **2 signals**: licence to
+  build, capex, funding mix, peak-utilisation revenue. The tell is the
+  direction of the money.
+- An EPC order to build something *for a customer* trips only 1 signal and
+  stays an order.
+- The value anti-cues now reject capex and projected-revenue figures
+  independently.
+- `cli recheck` was added: it replays the rules over the stored filing text,
+  so the database no longer needs wiping after rule changes.
+
+## 12 Sep — dashboard design rounds
+
+- One order filed on both exchanges is stored twice and collapsed into one
+  row in the display layer only (`_same_order`).
+- Visual pass:
+  - only HIGH and MEDIUM get a status hue; WATCH and STORE are told apart by
+    the shape of their dot;
+  - numbers are printed in normal text colour;
+  - glass surfaces;
+  - an Auto/Light/Dark theme toggle.
+- Trap: `overflow-x:auto` on a container plus a sticky `thead` makes the
+  header float. Use `overflow:clip`.
+- Writes to `dashboard.py` were reverted twice, probably by a stale editor
+  buffer. Always verify the file after writing it.
+
+## Mid-Sep — Telegram, guidance, Reg-30 table, summaries
+
+- Secrets are read from `.env` at the root. Check them with `cli config` and
+  `cli test-alert`, which auto-discovers the chat id.
+- Messages use HTML parse mode, so every field goes through `alert._esc()`.
+- `extract/guidance.py`: management guidance ("FY27 total income Rs 105 Cr")
+  is scored separately and combined with the order score. Veerhealth's tiny
+  sample order came with guidance that implied income would triple.
+- `extract/reg30.py` reads the SEBI disclosure table structurally (ruled
+  tables, then word positions). Flattened text had interleaved the columns
+  and misread the related-party *question* as an answer on 50 of 65 orders.
+- `extract/summary.py` writes a one-sentence description of each order. It
+  replaced the old "whatever follows 'for'" scope.
+- Scheduling moved to hourly (08:00–22:00) with catch-up for time the PC was
+  off. The dashboard starts at sign-in on port 8765.
+
+## 18 Oct 2026 — Orderbook view
+
+The user wanted an order-book tracker like Financially Free's, on a separate
+page with a switch from the orders page.
+
+- **The key decision:** a book is not the sum of announced wins, because
+  execution is never seen. So the book is read from what companies state in
+  results releases, presentations, transcripts and order-win releases.
+- The extraction rules in `extract/orderbook.py` each come from a real
+  misread across 405 stored filings:
+  - targets and forecasts;
+  - new-order values next to the phrase;
+  - revenue after the anchor;
+  - table footnotes;
+  - billed amounts;
+  - "including orders negotiated";
+  - reductions;
+  - GW and metres read as money;
+  - the LSE's "International Order Book".
+
+  Segment and subsidiary books are kept but marked. A date glued to another
+  figure belongs to that figure.
+- Series: one point per as-of date. Growth is the latest point against the
+  earliest one inside the period.
+- `sources/company_meta.py` adds market cap and last-FY revenue from
+  screener.in. It is the first working market-cap source, because yfinance
+  returned nothing. Not yet verified live.
+- `orderbook fetch` opens candidate PDFs for companies that already have an
+  order (1,883 at the time). It reads them without caching, is resumable,
+  commits per filing and retries failed downloads.
+
+## 18 Oct — BSE outage (30 Sep – 18 Oct) and its fix
+
+- **What happened:** every BSE API call returned 403, and nothing alerted.
+  The database has no BSE filings for that window.
+- **First fix (not enough):** site-root `Referer` plus `Origin`, which was
+  the fix other projects used.
+- **Diagnosis:** Claude's built-in browser on the user's PC got a 200 from
+  the same API (no cookies needed), while python-requests got 403.
+- **Fix:** `sources/bse.py` now tries several strategies:
+  1. curl_cffi with `impersonate="chrome"` and the headers Chrome sends on
+     that call (`Sec-Fetch-Mode: cors`, `Sec-Fetch-Site: same-site`);
+  2. the same, after a cookie warm-up visit to the homepage;
+  3. requests with browser headers;
+  4. the legacy headers.
+
+  The first strategy BSE accepts is kept for the session.
+- `bse-check --probe` prints a status code per strategy. After the fix,
+  strategies 1–3 got 200 (so the browser-like headers alone were enough this
+  time) and the legacy headers got 403.
+- Feed health: a run where every call fails writes "BSE feed down" into
+  `runs.errors`. Three failed runs in a row send one Telegram warning, at
+  most once a day.
+- **Follow-up bug:** a streamed curl_cffi response has an empty `.content`,
+  so every PDF came back empty and was counted as a failed download.
+  `download_pdf` now reads the stream with `iter_content`, which also
+  enforces the size cap. A regression test is in `test_bse_feed.py`.
+- **Recovery:** `backfill --days 21`.

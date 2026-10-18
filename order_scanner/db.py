@@ -149,6 +149,41 @@ CREATE TABLE IF NOT EXISTS llm_cache (
     created_at  TEXT
 );
 
+-- Reported order books, one row per figure stated in a filing. Read from the
+-- company's own words (see extract/orderbook.py); never derived from the
+-- orders table, which only sees announced wins.
+CREATE TABLE IF NOT EXISTS orderbook (
+    snap_id         TEXT PRIMARY KEY,     -- sha1(ann_id|as_of|value)
+    ann_id          TEXT REFERENCES announcements(ann_id),
+    company_id      TEXT REFERENCES companies(company_id),
+    exchange        TEXT,
+    filed_at        TEXT,
+    as_of           TEXT,                 -- YYYY-MM-DD the figure is stated as of
+    as_of_basis     TEXT,                 -- stated | quarter | year | filed
+    order_book_inr  REAL,
+    currency        TEXT,
+    is_approx       INTEGER DEFAULT 0,
+    scope           TEXT,                 -- total | segment | subsidiary
+    source_kind     TEXT,                 -- presentation | results | update | order_win | ...
+    method          TEXT,                 -- regex | manual
+    confidence      REAL,
+    quote           TEXT,                 -- the sentence it came from
+    notes           TEXT,
+    flags           TEXT,                 -- json list of plausibility warnings
+    created_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ob_company ON orderbook(company_id, as_of);
+CREATE INDEX IF NOT EXISTS idx_ob_ann ON orderbook(ann_id);
+
+-- Filings already opened for an order book, so a fetch never repeats a download.
+CREATE TABLE IF NOT EXISTS orderbook_checked (
+    ann_id      TEXT PRIMARY KEY,
+    checked_at  TEXT,
+    n_found     INTEGER,
+    source      TEXT,                     -- stored-text | pdf
+    error       TEXT
+);
+
 -- Bookkeeping for scheduled runs.
 CREATE TABLE IF NOT EXISTS runs (
     run_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -196,6 +231,9 @@ MIGRATIONS = [
     ("fundamentals", "last_fy_revenue_inr", "REAL"),
     ("fundamentals", "last_fy_other_income_inr", "REAL"),
     ("fundamentals", "last_fy_pat_inr", "REAL"),
+    ("fundamentals", "revenue_basis", "TEXT"),           # consolidated | standalone
+    ("fundamentals", "meta_as_of", "TEXT"),              # last screener.in refresh
+    ("companies", "market_cap_as_of", "TEXT"),
 ]
 
 
