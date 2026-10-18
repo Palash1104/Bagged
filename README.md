@@ -1,4 +1,4 @@
-# NSE / BSE Order Scanner
+# BAGGED - NSE / BSE Order Scanner
 
 Scans NSE and BSE corporate announcements for **order wins**, extracts the order
 value, weighs it against the company's revenue, scores it, and pushes the
