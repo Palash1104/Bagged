@@ -28,7 +28,12 @@ CURRENCY_SYMBOLS = {
 }
 
 _CUR = r"(?:₹|Rs\.?|INR|US\s?\$|USD|\$|EUR|€|GBP|£)"
-_NUM = r"\d{1,3}(?:,\d{2,3})*(?:\.\d+)?|\d+(?:\.\d+)?"
+# A comma-grouped figure needs at least one group (`+`, not `*`). With `*` the
+# first branch also matched a plain figure but stopped after three digits, so
+# "Rs.1307 Crore" was read as "Rs.130" and "7 Crore", and Bharat Dynamics'
+# Rs 1,307 Cr torpedo order (15 Oct 2026) was stored as Rs 7 Cr. Every
+# comma-less amount of 1,000 or more was split the same way.
+_NUM = r"\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+(?:\.\d+)?"
 _UNIT = (
     r"(?:crores?|crs?\.?|lakhs?|lacs?|millions?|mn\.?|mio|billions?|bn\.?|"
     r"thousand|arab)"

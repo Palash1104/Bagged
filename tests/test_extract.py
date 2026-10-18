@@ -45,6 +45,20 @@ VALUE_CASES = [
     ("The Company has received an order for supply of transformers. "
      "Total value of the order is Rs. 9.87 Cr, to be executed within 9 months.",
      9.87 * CR, "abbreviated Cr"),
+
+    # Bharat Dynamics, 15 Oct 2026: a figure of four digits or more written
+    # without commas was split in two -- "Rs.130" and "7 Crore" -- and the
+    # order was stored as Rs 7 Cr instead of Rs 1,307 Cr.
+    ("BDL has signed a contract on 15 October 2026 for supply of Heavyweight "
+     "torpedoes, valued at approximately Rs.1307 Crore + taxes to be completed "
+     "within 42 months.", 1307 * CR, "4 digits, no commas (BDL)"),
+    ("Broad consideration or size of the order(s) Rs.1307 Crore + taxes",
+     1307 * CR, "Reg-30 cell, no commas (BDL)"),
+    ("The Company has bagged an order worth INR 2654 Cr from Indian Railways.",
+     2654 * CR, "INR, 4 digits"),
+    ("Order valued at Rs 1200-1500 crore received from NHPC.",
+     1350 * CR, "range, 4 digits each side"),
+    ("Receipt of export order of USD 1500 million.", 1500e6 * 88, "USD, 4 digits"),
 ]
 
 

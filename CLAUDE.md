@@ -130,7 +130,7 @@ These are settled; don't undo them without asking.
 - **Explain briefly.** The user often asks for answers "in short".
 - After any change, run the test suites (all must pass):
   ```
-  python tests\test_extract.py          :: 71
+  python tests\test_extract.py          :: 76
   python tests\test_score.py            :: 25
   python tests\test_pipeline_smoke.py   :: 24
   python tests\test_orderbook.py        :: 53

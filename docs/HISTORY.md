@@ -246,3 +246,22 @@ page with a switch from the orders page.
   a week. Empty fetches are no longer stamped, rows stamped without a market
   cap are retried, and bulk refreshes wait out a 429.
 - Tests: six series cases in test_orderbook (53).
+
+## 18 Oct — amounts of 1,000 or more without commas were split in two
+
+- **What happened:** Bharat Dynamics' 15 Oct order, "valued at approximately
+  Rs.1307 Crore + taxes", was stored as Rs 7 Cr (STORE, score 0). The Reg-30
+  table was read correctly ("Rs.1307 Crore + taxes"); the fault was in
+  `extract/money.py`.
+- **Cause:** the number pattern was `\d{1,3}(?:,\d{2,3})*...|\d+...`. The
+  first branch also matches a plain figure but stops after three digits, so
+  "Rs.1307 Crore" became "Rs.130" (no unit, dropped as too small) and
+  "7 Crore". Every comma-less amount of 1,000 or more was split this way
+  ("Rs 1250 crore" read nothing, "INR 2654 Cr" read 4 Cr) -- which hit the
+  largest orders hardest. On a copy of the DB, 53 stored orders had a value
+  the fixed reader disagrees with, among them RVNL Rs 2,977 Cr stored as 7,
+  KPIL Rs 3,526 Cr as 6, Vikran Rs 3,518 Cr as 7.98, Coal India Rs 2,831 Cr
+  as 1.11.
+- **Fix:** the comma branch needs at least one comma group (`+`), as
+  `extract/orderbook.py` already had. Five cases from these filings in
+  test_extract (76). Repair: `cli recheck`.
